@@ -2,12 +2,14 @@ package overlay
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/cidr"
@@ -21,8 +23,11 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+var udpTimeout = 5 * time.Minute
 
 type netstackDev struct {
 	cidr      *net.IPNet
@@ -74,7 +79,7 @@ func (d *netstackDev) Activate() error {
 		},
 		TransportProtocols: []stack.TransportProtocolFactory{
 			tcp.NewProtocol,
-			//udp.NewProtocol,
+			udp.NewProtocol,
 			//icmp.NewProtocol4,
 		},
 	})
@@ -124,8 +129,12 @@ func (d *netstackDev) Activate() error {
 	}
 
 	// Set up protocol handler for incoming TCP connections so they can be proxied locally
-	fwd := tcp.NewForwarder(d.stack, 0, 5, (*endpoint)(d).handleTCP)
-	d.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+	fwdTCP := tcp.NewForwarder(d.stack, 0, 5, (*endpoint)(d).handleTCP)
+	d.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwdTCP.HandlePacket)
+
+	// Set up protocol handler for incoming UDP connections so they can be proxied locally
+	fwdUDP := udp.NewForwarder(d.stack, (*endpoint)(d).handleUDP)
+	d.stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwdUDP.HandlePacket)
 
 	return nil
 }
@@ -322,4 +331,99 @@ func (e *endpoint) handleTCP(r *tcp.ForwarderRequest) {
 	}
 
 	log.Info("Ended TCP forwarding")
+}
+
+func (e *endpoint) handleUDP(r *udp.ForwarderRequest) {
+	reqTuple := r.ID()
+
+	log := logrus.WithFields(logrus.Fields{
+		"localAddr":  reqTuple.LocalAddress,
+		"localPort":  reqTuple.LocalPort,
+		"remoteAddr": reqTuple.RemoteAddress,
+		"remotePort": reqTuple.RemotePort,
+	})
+
+	go func() {
+		log.Info("Starting UDP forwarding")
+
+		var wq waiter.Queue
+		ep, tcipiperr := r.CreateEndpoint(&wq)
+		if tcipiperr != nil {
+			log.WithField("error", tcipiperr).Error("CreateEndpoint error")
+			return
+		}
+
+		source := gonet.NewUDPConn(e.stack, &wq, ep)
+		defer source.Close()
+
+		// Check if destination is the local Nebula IP and if so, forward to localhost instead
+		var dstAddr *net.UDPAddr
+		var localAddr *net.UDPAddr
+		if bytes.Equal(e.cidr.IP, []byte(reqTuple.LocalAddress)) {
+			dstAddr = &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: int(reqTuple.LocalPort)}
+			localAddr = &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: 0}
+		} else {
+			dstAddr = &net.UDPAddr{IP: net.IP(reqTuple.LocalAddress), Port: int(reqTuple.LocalPort)}
+			localAddr = &net.UDPAddr{IP: net.IP{0, 0, 0, 0}, Port: 0}
+		}
+		srcAddr := &net.UDPAddr{IP: net.IP(reqTuple.RemoteAddress), Port: int(reqTuple.RemotePort)}
+
+		// Set up listener to receive UDP packets coming back from target
+		dest, err := net.ListenUDP("udp", localAddr)
+		if err != nil {
+			log.WithError(err).Error("ListenUDP error")
+			return
+		}
+		defer dest.Close()
+
+		// Start a goroutine to copy data in each direction for the proxy and then
+		// wait for completion
+		copy := func(ctx context.Context, dst net.PacketConn, dstAddr net.Addr, src net.PacketConn, errC chan<- error) {
+			buf := make([]byte, e.mtu)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					var n int
+					var err error
+					n, _, err = src.ReadFrom(buf)
+					if err == nil {
+						_, err = dst.WriteTo(buf[:n], dstAddr)
+					}
+
+					// Return error code or nil to the error channel. Nil value
+					// is used to signal activity.
+					select {
+					case errC <- err:
+					default:
+					}
+				}
+			}
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errors := make(chan error, 2)
+		go copy(ctx, dest, dstAddr, source, errors)
+		go copy(ctx, source, srcAddr, dest, errors)
+
+		// Tear down the forwarding if there is no activity after a certain
+		// period of time
+		for keepGoing := true; keepGoing; {
+			select {
+			case err := <-errors:
+				if err != nil {
+					log.WithError(err).Error("Error during UDP forwarding")
+					keepGoing = false
+				}
+				// If err is nil then this means some activity has occurred, so
+				// reset the timeout timer by restarting the select
+			case <-time.After(udpTimeout):
+				log.Info("UDP forwarding timed out")
+				keepGoing = false
+			}
+		}
+		cancel()
+		log.Info("Ended UDP forwarding")
+	}()
 }
