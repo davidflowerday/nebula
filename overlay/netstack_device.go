@@ -14,6 +14,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/cidr"
 	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/socks"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -135,6 +136,27 @@ func (d *netstackDev) Activate() error {
 	// Set up protocol handler for incoming UDP connections so they can be proxied locally
 	fwdUDP := udp.NewForwarder(d.stack, (*endpoint)(d).handleUDP)
 	d.stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwdUDP.HandlePacket)
+
+	// Set up SOCKS server to forward connections to Nebula
+	stackDialer := func(ctx context.Context, network, address string) (net.Conn, error) {
+		netaddr := netip.MustParseAddrPort(address)
+
+		addr := tcpip.FullAddress{
+			NIC:  d.nicID,
+			Addr: tcpip.Address(netaddr.Addr().AsSlice()),
+			Port: netaddr.Port(),
+		}
+
+		return gonet.DialContextTCP(ctx, d.stack, addr, ipv4.ProtocolNumber)
+	}
+	s := socks.New(d.log, stackDialer)
+	go func() {
+		listener, err := net.Listen("tcp", ":1080")
+		if err != nil {
+			panic(err)
+		}
+		s.Serve(listener)
+	}()
 
 	return nil
 }
