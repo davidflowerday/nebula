@@ -18,7 +18,6 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	tcpipbuffer "gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -41,7 +40,7 @@ type netstackDev struct {
 	stack          *stack.Stack
 	nicID          tcpip.NICID
 	dispatcher     stack.NetworkDispatcher
-	incomingPacket chan tcpipbuffer.VectorisedView
+	incomingPacket chan *stack.PacketBuffer
 }
 
 type endpoint netstackDev
@@ -66,7 +65,7 @@ func newNetstackDevice(l *logrus.Logger, cidr *net.IPNet, defaultMTU int, routes
 		log:       l,
 
 		nicID:          tcpip.NICID(1),
-		incomingPacket: make(chan tcpipbuffer.VectorisedView),
+		incomingPacket: make(chan *stack.PacketBuffer),
 	}
 
 	return dev, nil
@@ -183,7 +182,13 @@ func (d *netstackDev) Read(buf []byte) (int, error) {
 	if !ok {
 		return 0, os.ErrClosed
 	}
-	return pkt.Read(buf)
+
+	b := pkt.Buffer()
+	n := copy(buf, b.Flatten())
+
+	pkt.DecRef()
+
+	return n, nil
 }
 
 func (d *netstackDev) Write(buf []byte) (int, error) {
@@ -193,7 +198,7 @@ func (d *netstackDev) Write(buf []byte) (int, error) {
 
 	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.NewWithData(buf)})
 
-	switch buf[0] >> 4 {
+	switch header.IPVersion(buf) {
 	case header.IPv4Version:
 		d.dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pb)
 	case header.IPv6Version:
@@ -282,8 +287,8 @@ func (e *endpoint) AddHeader(*stack.PacketBuffer) {
 // it is not safe to use the PacketBufferList after a call to WritePackets.
 func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	n := 0
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		e.incomingPacket <- tcpipbuffer.NewVectorisedView(pkt.Size(), pkt.Views())
+	for _, pkt := range pkts.AsSlice() {
+		e.incomingPacket <- pkt.IncRef()
 		n++
 	}
 
