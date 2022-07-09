@@ -190,7 +190,13 @@ func (d *netstackDev) Write(buf []byte) (int, error) {
 		return 0, nil
 	}
 
-	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.NewWithData(buf)})
+	// NewPacketBuffer takes ownership of the data, so making a copy is
+	// necessary
+	data := make([]byte, len(buf))
+	copy(data, buf)
+	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.NewWithData(data),
+	})
 
 	var ipver tcpip.NetworkProtocolNumber
 	switch header.IPVersion(buf) {
