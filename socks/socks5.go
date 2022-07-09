@@ -230,10 +230,12 @@ func (s *socks5) handleConnect(conn net.Conn, target string) error {
 	errC := make(chan error, 2)
 	go copy(dstConn, conn, errC)
 	go copy(conn, dstConn, errC)
-	err = <-errC
 
-	if err != nil {
-		return fmt.Errorf("while proxying connection: %w", err)
+	for i := 0; i < 2; i++ {
+		err = <-errC
+		if err != nil {
+			return fmt.Errorf("while proxying connection: %w", err)
+		}
 	}
 
 	return err
