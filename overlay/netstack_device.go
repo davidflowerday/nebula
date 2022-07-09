@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"os"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -19,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -37,13 +37,10 @@ type netstackDev struct {
 	routeTree *cidr.Tree4
 	log       *logrus.Logger
 
-	stack          *stack.Stack
-	nicID          tcpip.NICID
-	dispatcher     stack.NetworkDispatcher
-	incomingPacket chan *stack.PacketBuffer
+	stack *stack.Stack
+	ep    *channel.Endpoint
+	nicID tcpip.NICID
 }
-
-type endpoint netstackDev
 
 func newNetstackDevice(l *logrus.Logger, cidr *net.IPNet, defaultMTU int, routes []Route) (*netstackDev, error) {
 	routeTree, err := makeRouteTree(l, routes, false)
@@ -64,8 +61,7 @@ func newNetstackDevice(l *logrus.Logger, cidr *net.IPNet, defaultMTU int, routes
 		routeTree: routeTree,
 		log:       l,
 
-		nicID:          tcpip.NICID(1),
-		incomingPacket: make(chan *stack.PacketBuffer),
+		nicID: tcpip.NICID(1),
 	}
 
 	return dev, nil
@@ -85,7 +81,8 @@ func (d *netstackDev) Activate() error {
 	})
 
 	// Create virtual NIC on netstack to represent the Nebula interface
-	if err := d.stack.CreateNIC(d.nicID, (*endpoint)(d)); err != nil {
+	d.ep = channel.New(128, uint32(d.mtu), "")
+	if err := d.stack.CreateNIC(d.nicID, d.ep); err != nil {
 		return errors.New(err.String())
 	}
 
@@ -129,11 +126,11 @@ func (d *netstackDev) Activate() error {
 	}
 
 	// Set up protocol handler for incoming TCP connections so they can be proxied locally
-	fwdTCP := tcp.NewForwarder(d.stack, 0, 5, (*endpoint)(d).handleTCP)
+	fwdTCP := tcp.NewForwarder(d.stack, 0, 5, d.handleTCP)
 	d.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwdTCP.HandlePacket)
 
 	// Set up protocol handler for incoming UDP connections so they can be proxied locally
-	fwdUDP := udp.NewForwarder(d.stack, (*endpoint)(d).handleUDP)
+	fwdUDP := udp.NewForwarder(d.stack, d.handleUDP)
 	d.stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwdUDP.HandlePacket)
 
 	// Set up SOCKS server to forward connections to Nebula
@@ -178,10 +175,7 @@ func (d *netstackDev) Name() string {
 }
 
 func (d *netstackDev) Read(buf []byte) (int, error) {
-	pkt, ok := <-d.incomingPacket
-	if !ok {
-		return 0, os.ErrClosed
-	}
+	pkt := d.ep.ReadContext(context.Background())
 
 	b := pkt.Buffer()
 	n := copy(buf, b.Flatten())
@@ -198,14 +192,16 @@ func (d *netstackDev) Write(buf []byte) (int, error) {
 
 	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.NewWithData(buf)})
 
+	var ipver tcpip.NetworkProtocolNumber
 	switch header.IPVersion(buf) {
 	case header.IPv4Version:
-		d.dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pb)
+		ipver = ipv4.ProtocolNumber
 	case header.IPv6Version:
-		d.dispatcher.DeliverNetworkPacket(ipv6.ProtocolNumber, pb)
+		ipver = ipv6.ProtocolNumber
 	default:
 		return 0, fmt.Errorf("invalid IP version")
 	}
+	d.ep.InjectInbound(ipver, pb)
 
 	return len(buf), nil
 }
@@ -218,87 +214,10 @@ func (d *netstackDev) Close() error {
 	return nil // FIXME
 }
 
-// MTU is the maximum transmission unit for this endpoint. This is
-// usually dictated by the backing physical network; when such a
-// physical network doesn't exist, the limit is generally 64k, which
-// includes the maximum size of an IP packet.
-func (e *endpoint) MTU() uint32 {
-	return uint32(e.mtu)
-}
-
-// MaxHeaderLength returns the maximum size the data link (and
-// lower level layers combined) headers can have. Higher levels use this
-// information to reserve space in the front of the packets they're
-// building.
-func (e *endpoint) MaxHeaderLength() uint16 {
-	return 0
-}
-
-// LinkAddress returns the link address (typically a MAC) of the
-// endpoint.
-func (e *endpoint) LinkAddress() tcpip.LinkAddress {
-	return ""
-}
-
-// Capabilities returns the set of capabilities supported by the
-// endpoint.
-func (e *endpoint) Capabilities() stack.LinkEndpointCapabilities {
-	return stack.CapabilityNone
-}
-
-// Attach attaches the data link layer endpoint to the network-layer
-// dispatcher of the stack.
-//
-// Attach is called with a nil dispatcher when the endpoint's NIC is being
-// removed.
-func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
-	e.dispatcher = dispatcher
-}
-
-// IsAttached returns whether a NetworkDispatcher is attached to the
-// endpoint.
-func (e *endpoint) IsAttached() bool {
-	return e.dispatcher != nil
-}
-
-// Wait waits for any worker goroutines owned by the endpoint to stop.
-//
-// For now, requesting that an endpoint's worker goroutine(s) stop is
-// implementation specific.
-//
-// Wait will not block if the endpoint hasn't started any goroutines
-// yet, even if it might later.
-func (e *endpoint) Wait() {
-}
-
-// ARPHardwareType returns the ARPHRD_TYPE of the link endpoint.
-func (e *endpoint) ARPHardwareType() header.ARPHardwareType {
-	return header.ARPHardwareNone
-}
-
-// AddHeader adds a link layer header to the packet if required.
-func (e *endpoint) AddHeader(*stack.PacketBuffer) {
-}
-
-// WritePackets writes packets. Must not be called with an empty list of
-// packet buffers.
-//
-// WritePackets may modify the packet buffers, and takes ownership of the PacketBufferList.
-// it is not safe to use the PacketBufferList after a call to WritePackets.
-func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
-	n := 0
-	for _, pkt := range pkts.AsSlice() {
-		e.incomingPacket <- pkt.IncRef()
-		n++
-	}
-
-	return n, nil
-}
-
 // handleTCP handles an incoming TCP connection (via Nebula) and proxies it to
 // the destination port on the target host (or localhost if the Nebula VPN IP
 // address is the target).
-func (e *endpoint) handleTCP(r *tcp.ForwarderRequest) {
+func (d *netstackDev) handleTCP(r *tcp.ForwarderRequest) {
 	reqTuple := r.ID()
 
 	log := logrus.WithFields(logrus.Fields{
@@ -326,7 +245,7 @@ func (e *endpoint) handleTCP(r *tcp.ForwarderRequest) {
 
 	// Check if destination is the local Nebula IP and if so, forward to localhost instead
 	var dstAddr string
-	if bytes.Equal(e.cidr.IP, []byte(reqTuple.LocalAddress)) {
+	if bytes.Equal(d.cidr.IP, []byte(reqTuple.LocalAddress)) {
 		dstAddr = fmt.Sprintf("127.0.0.1:%d", reqTuple.LocalPort)
 	} else {
 		dstAddr = fmt.Sprintf("%s:%d", reqTuple.LocalAddress.String(), reqTuple.LocalPort)
@@ -340,6 +259,8 @@ func (e *endpoint) handleTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 	defer target.Close()
+
+	log.Infof("Connected to %s", dstAddr)
 
 	// Start a goroutine to copy data in each direction for the proxy and then
 	// wait for completion
@@ -360,7 +281,7 @@ func (e *endpoint) handleTCP(r *tcp.ForwarderRequest) {
 	log.Info("Ended TCP forwarding")
 }
 
-func (e *endpoint) handleUDP(r *udp.ForwarderRequest) {
+func (d *netstackDev) handleUDP(r *udp.ForwarderRequest) {
 	reqTuple := r.ID()
 
 	log := logrus.WithFields(logrus.Fields{
@@ -380,13 +301,13 @@ func (e *endpoint) handleUDP(r *udp.ForwarderRequest) {
 			return
 		}
 
-		source := gonet.NewUDPConn(e.stack, &wq, ep)
+		source := gonet.NewUDPConn(d.stack, &wq, ep)
 		defer source.Close()
 
 		// Check if destination is the local Nebula IP and if so, forward to localhost instead
 		var dstAddr *net.UDPAddr
 		var localAddr *net.UDPAddr
-		if bytes.Equal(e.cidr.IP, []byte(reqTuple.LocalAddress)) {
+		if bytes.Equal(d.cidr.IP, []byte(reqTuple.LocalAddress)) {
 			dstAddr = &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: int(reqTuple.LocalPort)}
 			localAddr = &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: 0}
 		} else {
@@ -406,7 +327,7 @@ func (e *endpoint) handleUDP(r *udp.ForwarderRequest) {
 		// Start a goroutine to copy data in each direction for the proxy and then
 		// wait for completion
 		copy := func(ctx context.Context, dst net.PacketConn, dstAddr net.Addr, src net.PacketConn, errC chan<- error) {
-			buf := make([]byte, e.mtu)
+			buf := make([]byte, d.mtu)
 			for {
 				select {
 				case <-ctx.Done():
