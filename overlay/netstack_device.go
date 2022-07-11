@@ -30,19 +30,21 @@ import (
 var udpTimeout = 5 * time.Minute
 
 type netstackDev struct {
-	cidr      *net.IPNet
-	prefix    netip.Prefix
-	mtu       int
-	Routes    []Route
-	routeTree *cidr.Tree4
-	log       *logrus.Logger
+	cidr        *net.IPNet
+	prefix      netip.Prefix
+	mtu         int
+	Routes      []Route
+	routeTree   *cidr.Tree4
+	log         *logrus.Logger
+	enableNAT   bool
+	enableSOCKS bool
 
 	stack *stack.Stack
 	ep    *channel.Endpoint
 	nicID tcpip.NICID
 }
 
-func newNetstackDevice(l *logrus.Logger, cidr *net.IPNet, defaultMTU int, routes []Route) (*netstackDev, error) {
+func newNetstackDevice(l *logrus.Logger, cidr *net.IPNet, defaultMTU int, routes []Route, enableNAT, enableSOCKS bool) (*netstackDev, error) {
 	routeTree, err := makeRouteTree(l, routes, false)
 	if err != nil {
 		return nil, err
@@ -54,12 +56,14 @@ func newNetstackDevice(l *logrus.Logger, cidr *net.IPNet, defaultMTU int, routes
 	}
 
 	dev := &netstackDev{
-		cidr:      cidr,
-		prefix:    prefix,
-		mtu:       defaultMTU,
-		Routes:    routes,
-		routeTree: routeTree,
-		log:       l,
+		cidr:        cidr,
+		prefix:      prefix,
+		mtu:         defaultMTU,
+		Routes:      routes,
+		routeTree:   routeTree,
+		log:         l,
+		enableNAT:   enableNAT,
+		enableSOCKS: enableSOCKS,
 
 		nicID: tcpip.NICID(1),
 	}
@@ -125,34 +129,40 @@ func (d *netstackDev) Activate() error {
 		d.log.WithFields(logrus.Fields{"subnet": r.Cidr, "via": r.Via}).Info("Added subnet route")
 	}
 
-	// Set up protocol handler for incoming TCP connections so they can be proxied locally
-	fwdTCP := tcp.NewForwarder(d.stack, 0, 5, d.handleTCP)
-	d.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwdTCP.HandlePacket)
+	if d.enableNAT {
+		d.log.Info("Enabling NAT")
 
-	// Set up protocol handler for incoming UDP connections so they can be proxied locally
-	fwdUDP := udp.NewForwarder(d.stack, d.handleUDP)
-	d.stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwdUDP.HandlePacket)
+		// Set up protocol handler for incoming TCP connections so they can be proxied locally
+		fwdTCP := tcp.NewForwarder(d.stack, 0, 5, d.handleTCP)
+		d.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwdTCP.HandlePacket)
 
-	// Set up SOCKS server to forward connections to Nebula
-	stackDialer := func(ctx context.Context, network, address string) (net.Conn, error) {
-		netaddr := netip.MustParseAddrPort(address)
-
-		addr := tcpip.FullAddress{
-			NIC:  d.nicID,
-			Addr: tcpip.Address(netaddr.Addr().AsSlice()),
-			Port: netaddr.Port(),
-		}
-
-		return gonet.DialContextTCP(ctx, d.stack, addr, ipv4.ProtocolNumber)
+		// Set up protocol handler for incoming UDP connections so they can be proxied locally
+		fwdUDP := udp.NewForwarder(d.stack, d.handleUDP)
+		d.stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwdUDP.HandlePacket)
 	}
-	s := socks.New(d.log, stackDialer)
-	go func() {
-		listener, err := net.Listen("tcp", ":1080")
-		if err != nil {
-			panic(err)
+
+	if d.enableSOCKS {
+		// Set up SOCKS server to forward connections to Nebula
+		stackDialer := func(ctx context.Context, network, address string) (net.Conn, error) {
+			netaddr := netip.MustParseAddrPort(address)
+
+			addr := tcpip.FullAddress{
+				NIC:  d.nicID,
+				Addr: tcpip.Address(netaddr.Addr().AsSlice()),
+				Port: netaddr.Port(),
+			}
+
+			return gonet.DialContextTCP(ctx, d.stack, addr, ipv4.ProtocolNumber)
 		}
-		s.Serve(listener)
-	}()
+		s := socks.New(d.log, stackDialer)
+		go func() {
+			listener, err := net.Listen("tcp", ":1080")
+			if err != nil {
+				panic(err)
+			}
+			s.Serve(listener)
+		}()
+	}
 
 	return nil
 }

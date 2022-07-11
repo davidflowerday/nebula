@@ -33,6 +33,8 @@ func NewDeviceFromConfig(c *config.C, l *logrus.Logger, tunCidr *net.IPNet, fd *
 			tunCidr,
 			c.GetInt("tun.mtu", DefaultMTU),
 			routes,
+			c.GetBool("netstack.nat_enabled", false),
+			c.GetBool("netstack.socks_enabled", false),
 		)
 
 	case fd != nil:
