@@ -53,7 +53,7 @@ func New(l *logrus.Logger, dialer DialTCP) *socks5 {
 }
 
 func (s *socks5) Serve(listener net.Listener) {
-	s.log.Info("SOCKS server started")
+	s.log.WithField("socksListener", listener.Addr()).Info("SOCKS server is listening")
 
 	for {
 		conn, err := listener.Accept()

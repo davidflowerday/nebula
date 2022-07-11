@@ -226,7 +226,7 @@ func (d *netstackDev) Close() error {
 func (d *netstackDev) handleTCP(r *tcp.ForwarderRequest) {
 	reqTuple := r.ID()
 
-	log := logrus.WithFields(logrus.Fields{
+	log := d.log.WithFields(logrus.Fields{
 		"localAddr":  reqTuple.LocalAddress,
 		"localPort":  reqTuple.LocalPort,
 		"remoteAddr": reqTuple.RemoteAddress,
@@ -266,7 +266,7 @@ func (d *netstackDev) handleTCP(r *tcp.ForwarderRequest) {
 	}
 	defer target.Close()
 
-	log.Infof("Connected to %s", dstAddr)
+	log.WithField("dstAddr", dstAddr).Info("Connected")
 
 	// Start a goroutine to copy data in each direction for the proxy and then
 	// wait for completion
@@ -290,7 +290,7 @@ func (d *netstackDev) handleTCP(r *tcp.ForwarderRequest) {
 func (d *netstackDev) handleUDP(r *udp.ForwarderRequest) {
 	reqTuple := r.ID()
 
-	log := logrus.WithFields(logrus.Fields{
+	log := d.log.WithFields(logrus.Fields{
 		"localAddr":  reqTuple.LocalAddress,
 		"localPort":  reqTuple.LocalPort,
 		"remoteAddr": reqTuple.RemoteAddress,
