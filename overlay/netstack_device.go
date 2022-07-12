@@ -68,11 +68,7 @@ func newNetstackDevice(l *logrus.Logger, cidr *net.IPNet, defaultMTU int, routes
 		nicID: tcpip.NICID(1),
 	}
 
-	return dev, nil
-}
-
-func (d *netstackDev) Activate() error {
-	d.stack = stack.New(stack.Options{
+	dev.stack = stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
 			//arp.NewProtocol,
@@ -85,20 +81,24 @@ func (d *netstackDev) Activate() error {
 	})
 
 	// Create virtual NIC on netstack to represent the Nebula interface
-	d.ep = channel.New(128, uint32(d.mtu), "")
-	if err := d.stack.CreateNIC(d.nicID, d.ep); err != nil {
-		return errors.New(err.String())
+	dev.ep = channel.New(128, uint32(dev.mtu), "")
+	if err := dev.stack.CreateNIC(dev.nicID, dev.ep); err != nil {
+		return nil, errors.New(err.String())
 	}
 
 	// Set virtual NIC IP address
 	protocolAddr := tcpip.ProtocolAddress{
 		Protocol:          ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.Address(d.cidr.IP.To4()).WithPrefix(),
+		AddressWithPrefix: tcpip.Address(dev.cidr.IP.To4()).WithPrefix(),
 	}
-	if err := d.stack.AddProtocolAddress(d.nicID, protocolAddr, stack.AddressProperties{}); err != nil {
-		d.log.WithFields(logrus.Fields{"error": err, "protocolAddr": protocolAddr}).Fatal("AddProtocolAddress error")
+	if err := dev.stack.AddProtocolAddress(dev.nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+		dev.log.WithFields(logrus.Fields{"error": err, "protocolAddr": protocolAddr}).Fatal("AddProtocolAddress error")
 	}
 
+	return dev, nil
+}
+
+func (d *netstackDev) Activate() error {
 	// Enable promiscuous mode so that we get callbacks for all traffic on the
 	// interface rather than just traffic destined for the bound IP
 	d.stack.SetPromiscuousMode(d.nicID, true)
@@ -228,6 +228,23 @@ func (d *netstackDev) NewMultiQueueReader() (io.ReadWriteCloser, error) {
 
 func (d *netstackDev) Close() error {
 	return nil // FIXME
+}
+
+// ListenUDP sets up a UDP listening connection on the device at the specified
+// port number
+func (d *netstackDev) ListenUDP(port uint16) net.PacketConn {
+	addr := tcpip.FullAddress{
+		NIC:  d.nicID,
+		Addr: tcpip.Address(d.cidr.IP.To4()),
+		Port: port,
+	}
+
+	conn, err := gonet.DialUDP(d.stack, &addr, nil, ipv4.ProtocolNumber)
+	if err != nil {
+		d.log.WithError(err).Error("DialUDP")
+	}
+
+	return conn
 }
 
 // handleTCP handles an incoming TCP connection (via Nebula) and proxies it to

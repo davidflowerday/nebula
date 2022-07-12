@@ -249,7 +249,7 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 	//handshakeAcceptedMACKeys := config.GetStringSlice("handshake_mac.accepted_keys", []string{})
 
 	serveDns := false
-	if c.GetBool("lighthouse.serve_dns", false) {
+	if c.GetBool("lighthouse.serve_dns", false) || c.GetBool("tun.dns.serve_dns", false) {
 		if c.GetBool("lighthouse.am_lighthouse", false) {
 			serveDns = true
 		} else {
@@ -333,7 +333,20 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 	var dnsStart func()
 	if lightHouse.amLighthouse && serveDns {
 		l.Debugln("Starting dns server")
-		dnsStart = dnsMain(l, hostMap, c, nil)
+		dnsStart = func() {
+			if listener, ok := tun.(overlay.UDPListener); ok {
+				if c.GetBool("tun.dns.serve_dns", false) {
+					conn := listener.ListenUDP(uint16(c.GetInt("tun.dns.port", 53)))
+					start := dnsMain(l, hostMap, c, conn)
+					go start()
+				}
+			}
+
+			if c.GetBool("lighthouse.serve_dns", false) {
+				start := dnsMain(l, hostMap, c, nil)
+				start()
+			}
+		}
 	}
 
 	return &Control{ifce, l, cancel, sshStart, statsStart, dnsStart}, nil
