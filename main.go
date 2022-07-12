@@ -333,7 +333,7 @@ func Main(c *config.C, configTest bool, buildVersion string, logger *logrus.Logg
 	var dnsStart func()
 	if lightHouse.amLighthouse && serveDns {
 		l.Debugln("Starting dns server")
-		dnsStart = dnsMain(l, hostMap, c)
+		dnsStart = dnsMain(l, hostMap, c, nil)
 	}
 
 	return &Control{ifce, l, cancel, sshStart, statsStart, dnsStart}, nil

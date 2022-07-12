@@ -111,20 +111,15 @@ func handleDnsRequest(l *logrus.Logger, w dns.ResponseWriter, r *dns.Msg) {
 	w.WriteMsg(m)
 }
 
-func dnsMain(l *logrus.Logger, hostMap *HostMap, c *config.C) func() {
+func dnsMain(l *logrus.Logger, hostMap *HostMap, c *config.C, pc net.PacketConn) func() {
 	dnsR = newDnsRecords(hostMap)
 
-	// attach request handler func
-	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		handleDnsRequest(l, w, r)
-	})
-
 	c.RegisterReloadCallback(func(c *config.C) {
-		reloadDns(l, c)
+		reloadDns(l, c, pc)
 	})
 
 	return func() {
-		startDns(l, c)
+		startDns(l, c, pc)
 	}
 }
 
@@ -132,18 +127,37 @@ func getDnsServerAddr(c *config.C) string {
 	return c.GetString("lighthouse.dns.host", "") + ":" + strconv.Itoa(c.GetInt("lighthouse.dns.port", 53))
 }
 
-func startDns(l *logrus.Logger, c *config.C) {
+func startDns(l *logrus.Logger, c *config.C, pc net.PacketConn) {
 	dnsAddr = getDnsServerAddr(c)
-	dnsServer = &dns.Server{Addr: dnsAddr, Net: "udp"}
-	l.WithField("dnsListener", dnsAddr).Info("Starting DNS responder")
-	err := dnsServer.ListenAndServe()
+
+	// attach request handler func
+	mux := &dns.ServeMux{}
+	mux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		handleDnsRequest(l, w, r)
+	})
+
+	dnsServer := &dns.Server{
+		Handler: mux,
+	}
+
+	var err error
+	if pc != nil {
+		l.WithField("dnsListener", pc.LocalAddr()).Info("Starting DNS responder")
+		dnsServer.PacketConn = pc
+		err = dnsServer.ActivateAndServe()
+	} else {
+		l.WithField("dnsListener", dnsAddr).Info("Starting DNS responder")
+		dnsServer.Addr = dnsAddr
+		dnsServer.Net = "udp"
+		err = dnsServer.ListenAndServe()
+	}
 	defer dnsServer.Shutdown()
 	if err != nil {
 		l.Errorf("Failed to start server: %s\n ", err.Error())
 	}
 }
 
-func reloadDns(l *logrus.Logger, c *config.C) {
+func reloadDns(l *logrus.Logger, c *config.C, pc net.PacketConn) {
 	if dnsAddr == getDnsServerAddr(c) {
 		l.Debug("No DNS server config change detected")
 		return
@@ -151,5 +165,5 @@ func reloadDns(l *logrus.Logger, c *config.C) {
 
 	l.Debug("Restarting DNS server")
 	dnsServer.Shutdown()
-	go startDns(l, c)
+	go startDns(l, c, pc)
 }
