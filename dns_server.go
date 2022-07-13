@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/miekg/dns"
@@ -66,12 +67,17 @@ func (d *dnsRecords) Add(host, data string) {
 	d.Unlock()
 }
 
-func parseQuery(l *logrus.Logger, m *dns.Msg, w dns.ResponseWriter) {
+func parseQuery(l *logrus.Logger, m *dns.Msg, w dns.ResponseWriter, autoSuffix string) {
 	for _, q := range m.Question {
+		searchName := q.Name
+		if len(autoSuffix) > 0 && strings.HasSuffix(q.Name, "."+autoSuffix) {
+			searchName = strings.TrimSuffix(q.Name, autoSuffix)
+		}
+
 		switch q.Qtype {
 		case dns.TypeA:
 			l.Debugf("Query for A %s", q.Name)
-			ip := dnsR.Query(q.Name)
+			ip := dnsR.Query(searchName)
 			if ip != "" {
 				rr, err := dns.NewRR(fmt.Sprintf("%s A %s", q.Name, ip))
 				if err == nil {
@@ -87,7 +93,7 @@ func parseQuery(l *logrus.Logger, m *dns.Msg, w dns.ResponseWriter) {
 				return
 			}
 			l.Debugf("Query for TXT %s", q.Name)
-			ip := dnsR.QueryCert(q.Name)
+			ip := dnsR.QueryCert(searchName)
 			if ip != "" {
 				rr, err := dns.NewRR(fmt.Sprintf("%s TXT %s", q.Name, ip))
 				if err == nil {
@@ -98,14 +104,14 @@ func parseQuery(l *logrus.Logger, m *dns.Msg, w dns.ResponseWriter) {
 	}
 }
 
-func handleDnsRequest(l *logrus.Logger, w dns.ResponseWriter, r *dns.Msg) {
+func handleDnsRequest(l *logrus.Logger, w dns.ResponseWriter, r *dns.Msg, autoSuffix string) {
 	m := new(dns.Msg)
 	m.SetReply(r)
 	m.Compress = false
 
 	switch r.Opcode {
 	case dns.OpcodeQuery:
-		parseQuery(l, m, w)
+		parseQuery(l, m, w, autoSuffix)
 	}
 
 	w.WriteMsg(m)
@@ -130,10 +136,12 @@ func getDnsServerAddr(c *config.C) string {
 func startDns(l *logrus.Logger, c *config.C, pc net.PacketConn) {
 	dnsAddr = getDnsServerAddr(c)
 
+	autoSuffix := c.GetString("tun.dns.auto_suffix", "")
+
 	// attach request handler func
 	mux := &dns.ServeMux{}
 	mux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		handleDnsRequest(l, w, r)
+		handleDnsRequest(l, w, r, autoSuffix)
 	})
 
 	dnsServer := &dns.Server{
